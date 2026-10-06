@@ -25,6 +25,7 @@ dependencies = [
     "imageio>=2.37.3",
     "transforms3d>=0.4.2",
     "gymnasium>=1.3.0",
+    "msgpack>=1.2.3",
 ]
 
 [tool.uv]
