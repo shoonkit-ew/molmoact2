@@ -23,6 +23,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, MixedPrecis
 from olmo.config import BaseConfig, StrEnum, DType, TransformerDataParallelWrappingStrategy
 from olmo.nn.cp_load_balancer import CPLoadBalancerType
 from olmo.data.data_loader import DataLoaderConfig
+from olmo.eval.action_validator import ActionValidatorConfig
 from olmo.eval.inf_evaluator import InfDatasetEvaluatorConfig
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.exceptions import OLMoConfigurationError
@@ -667,6 +668,9 @@ class TrainConfig(BaseConfig):
     """
     How often (in terms of batches) to run inference evaluations
     """
+
+    action_validator: Optional[ActionValidatorConfig] = None
+    """Held-out action validation (sampled-action MSE / accuracy@tau per dataset)."""
 
     save_inloop_predictions: bool = True
     """

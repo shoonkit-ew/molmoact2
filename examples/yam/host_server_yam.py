@@ -115,6 +115,99 @@ def _patch_modeling_for_bf16(local_dir: str) -> None:
             log.info("Applied patches %s in %s", applied, path)
 
 
+class AttentionCapture:
+    """Opt-in: what the action expert's cross-attention reads from the VLM's image tokens.
+
+    The action expert attends to the VLM's per-layer keys/values (prompt = 3 camera images + text +
+    state). `_attention` uses a fused SDPA kernel that doesn't return weights, so while `active` we
+    recompute softmax(q.k) for the same inputs, average over heads and action positions, and keep
+    one (S,) vector per (denoising step, layer). `input_ids` is grabbed from the call that feeds the
+    expert so image-patch positions (config.image_patch_id, in camera order) can be sliced out.
+    """
+
+    def __init__(self, model: Any, num_cameras: int) -> None:
+        self.active = False
+        self.num_cameras = num_cameras
+        self.image_patch_id = int(model.config.image_patch_id)
+        self.calls: list[torch.Tensor] = []
+        self.calls_vw: list[torch.Tensor] = []
+        self.input_ids: torch.Tensor | None = None
+        cross = [m for m in model.modules() if type(m).__name__ == "ActionExpertCrossAttention"]
+        if not cross:
+            raise RuntimeError("no ActionExpertCrossAttention found; attention capture unsupported")
+        self.num_layers = len(cross)
+        self.layer_of = {id(m): i for i, m in enumerate(cross)}  # module -> block index (model order)
+        self.layers: list[int] = []
+        cls, orig, cap = type(cross[0]), type(cross[0])._attention, self
+
+        def attention(self_, q, k, v, *, attn_mask=None):  # q: (B,T,H,D)  k: (B,S,H,D)
+            if cap.active:
+                scores = torch.einsum("bthd,bshd->bhts", q.float(), k.float()) * q.shape[-1] ** -0.5
+                if attn_mask is not None:
+                    scores = scores + attn_mask.float()
+                w = scores.softmax(-1)  # (B,H,T,S)
+                cap.layers.append(cap.layer_of[id(self_)])
+                cap.calls.append(w.mean(dim=(1, 2))[0])  # (S,)
+                # Value-norm weighting: sink tokens soak up attention but carry ~zero value, so
+                # attention x |v| shows what the output is actually made of.
+                wv = w * v.float().norm(dim=-1).transpose(1, 2)[:, :, None, :]  # (B,H,T,S)
+                cap.calls_vw.append((wv / wv.sum(-1, keepdim=True)).mean(dim=(1, 2))[0])
+            return orig(self_, q, k, v, attn_mask=attn_mask)
+
+        cls._attention = attention
+        # Norm of each image token as it enters the LLM: SigLIP2 forms a few fixed-position
+        # high-norm "register" patches (left edge, ~3500x the median after the projector) that act
+        # as attention sinks; the replay masks cells flagged here before drawing.
+        def vision_hook(mod, inp, out):
+            if cap.active:
+                feats = out[0] if isinstance(out, tuple) else out
+                cap.token_norm = feats.detach().float().reshape(-1, feats.shape[-1]).norm(dim=-1)
+
+        model.model.vision_backbone.register_forward_hook(vision_hook)
+        self.token_norm: torch.Tensor | None = None
+        inner, orig_gen = model.model, model.model.generate_actions_from_inputs
+
+        def generate(*args, **kwargs):
+            if cap.active:
+                cap.input_ids = kwargs["input_ids"].detach()
+            return orig_gen(*args, **kwargs)
+
+        inner.generate_actions_from_inputs = generate
+
+    def begin(self) -> None:
+        self.calls, self.calls_vw, self.layers, self.input_ids, self.active = [], [], [], None, True
+        self.token_norm = None
+
+    def finish(self) -> dict[str, Any]:
+        """Image attention per camera: maps (cams, g, g) of attention mass (all tokens sum to 1,
+        so a map's total is that camera's share), averaged over denoising steps and layers, plus
+        share_by_layer (layers, cams)."""
+        self.active = False
+        pos = (self.input_ids[0] == self.image_patch_id).nonzero().squeeze(-1)
+        per_cam = pos.numel() // self.num_cameras
+        grid = int(round(per_cam**0.5))
+        assert grid * grid * self.num_cameras == pos.numel(), f"image tokens {pos.numel()} not cams x square"
+
+        layer_idx = torch.tensor(self.layers, device=self.calls[0].device)
+
+        def image_part(calls):
+            # Average each block's calls over denoising steps, grouped by which block made them.
+            calls = torch.stack(calls)[:, pos]  # (n_calls, image tokens)
+            per_layer = torch.stack([calls[layer_idx == i].mean(0) for i in range(self.num_layers)])
+            return per_layer.view(self.num_layers, self.num_cameras, grid, grid)
+
+        raw, vw = image_part(self.calls), image_part(self.calls_vw)
+        return {
+            "maps": raw.mean(0).cpu().numpy().astype(np.float32),                  # (cams, g, g)
+            "maps_vw": vw.mean(0).cpu().numpy().astype(np.float32),                # value-norm weighted
+            "share_by_layer": raw.sum((-1, -2)).cpu().numpy().astype(np.float32),  # (layers, cams)
+            "maps_by_layer": raw.cpu().numpy().astype(np.float16),                 # (layers, cams, g, g)
+            "calls_per_layer": np.bincount(self.layers, minlength=self.num_layers),  # = denoising steps
+            "token_norm": (None if self.token_norm is None or self.token_norm.numel() != pos.numel() else
+                           self.token_norm.view(self.num_cameras, grid, grid).cpu().numpy().astype(np.float32)),
+        }
+
+
 class Policy:
     """Holds the loaded model + processor and serializes inference calls."""
 
@@ -124,12 +217,16 @@ class Policy:
         device: str,
         dtype: torch.dtype,
         enable_cuda_graph: bool = False,
+        norm_tag: str = NORM_TAG,
     ) -> None:
         self.default_cuda_graph = enable_cuda_graph
+        self.repo_id = repo_id
+        self.norm_tag = norm_tag
         # `predict_action` reads `norm_stats.json` from `config._name_or_path`.
-        # Always resolve to the local snapshot dir so that lookup works.
-        local_dir = snapshot_download(repo_id=repo_id)
-        log.info("Resolved snapshot dir: %s", local_dir)
+        # Always resolve to a local dir so that lookup works: either a converted
+        # fine-tune checkpoint already on disk, or the HF snapshot.
+        local_dir = repo_id if os.path.isdir(repo_id) else snapshot_download(repo_id=repo_id)
+        log.info("Resolved model dir: %s (norm_tag=%s)", local_dir, norm_tag)
 
         _patch_modeling_for_bf16(local_dir)
 
@@ -175,6 +272,7 @@ class Policy:
         # CUDA-graph capture in the action expert is not safe under concurrent
         # calls; coarse-grained serialization is fine at ~5 Hz robot poll.
         self._lock = threading.Lock()
+        self._capture: AttentionCapture | None = None
 
     @torch.inference_mode()
     def predict(
@@ -186,7 +284,8 @@ class Policy:
         state: np.ndarray,
         num_steps: int = DEFAULT_NUM_STEPS,
         enable_cuda_graph: bool = False,
-    ) -> np.ndarray:
+        return_attention: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
         # Camera order must match training: [top, left, right].
         images = [_to_pil(top_cam), _to_pil(left_cam), _to_pil(right_cam)]
         state_f32 = np.asarray(state, dtype=np.float32).reshape(-1)
@@ -196,25 +295,36 @@ class Policy:
             )
 
         with self._lock:
-            out = self.model.predict_action(
-                processor=self.processor,
-                images=images,
-                task=instruction,
-                state=state_f32,
-                norm_tag=NORM_TAG,
-                inference_action_mode="continuous",
-                enable_depth_reasoning=False,
-                num_steps=num_steps,
-                normalize_language=True,
-                enable_cuda_graph=enable_cuda_graph,
-            )
+            if return_attention:
+                if self._capture is None:
+                    self._capture = AttentionCapture(self.model, NUM_CAMERAS)
+                self._capture.begin()
+                enable_cuda_graph = False  # graphs replay a captured kernel; the hook would not run
+            try:
+                out = self._predict_action(images, instruction, state_f32, num_steps, enable_cuda_graph)
+            finally:
+                attention = self._capture.finish() if return_attention and self._capture.calls else None
         raw = out.actions
         if torch.is_tensor(raw):
             raw = raw.detach().to(dtype=torch.float32, device="cpu").numpy()
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        return actions
+        return (actions, attention) if return_attention else actions
+
+    def _predict_action(self, images, instruction, state_f32, num_steps, enable_cuda_graph):
+        return self.model.predict_action(
+            processor=self.processor,
+            images=images,
+            task=instruction,
+            state=state_f32,
+            norm_tag=self.norm_tag,
+            inference_action_mode="continuous",
+            enable_depth_reasoning=False,
+            num_steps=num_steps,
+            normalize_language=True,
+            enable_cuda_graph=enable_cuda_graph,
+        )
 
 
 def _to_pil(arr: Any) -> Image.Image:
@@ -236,8 +346,8 @@ def build_app(policy: Policy) -> FastAPI:
         return JSONResponse(
             {
                 "status": "ok",
-                "repo_id": REPO_ID,
-                "norm_tag": NORM_TAG,
+                "repo_id": policy.repo_id,
+                "norm_tag": policy.norm_tag,
                 "device": policy.device,
                 "dtype": str(policy.model.dtype),
                 "num_cameras": NUM_CAMERAS,
@@ -271,9 +381,10 @@ def build_app(policy: Policy) -> FastAPI:
             payload.get("enable_cuda_graph", policy.default_cuda_graph)
         )
 
+        return_attention = bool(payload.get("return_attention", False))
         t0 = time.perf_counter()
         try:
-            actions = policy.predict(
+            result = policy.predict(
                 top_cam=top_cam,
                 left_cam=left_cam,
                 right_cam=right_cam,
@@ -281,13 +392,18 @@ def build_app(policy: Policy) -> FastAPI:
                 state=state,
                 num_steps=num_steps,
                 enable_cuda_graph=enable_cuda_graph,
+                return_attention=return_attention,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("inference failed")
             return _error_response(500, f"inference failed: {e}")
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
-        body = json_numpy.dumps({"actions": actions, "dt_ms": dt_ms})
+        actions, attention = result if return_attention else (result, None)
+        reply = {"actions": actions, "dt_ms": dt_ms}
+        if attention is not None:
+            reply["attention"] = attention
+        body = json_numpy.dumps(reply)
         return Response(content=body, media_type="application/json")
 
     return app
@@ -324,7 +440,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="MolmoAct2-BimanualYAM inference server")
     p.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8202, help="bind port (default: 8202)")
-    p.add_argument("--repo-id", default=REPO_ID, help=f"HF repo id (default: {REPO_ID})")
+    p.add_argument(
+        "--repo-id", default=REPO_ID,
+        help=f"HF repo id, or a local converted checkpoint dir (default: {REPO_ID})",
+    )
+    p.add_argument(
+        "--norm-tag", default=NORM_TAG,
+        help=f"normalization tag in the checkpoint's norm_stats.json (default: {NORM_TAG})",
+    )
     p.add_argument("--device", default="cuda:0", help="torch device (default: cuda:0)")
     p.add_argument(
         "--dtype",
@@ -356,6 +479,7 @@ def main() -> None:
         device=args.device,
         dtype=dtype,
         enable_cuda_graph=args.cuda_graph,
+        norm_tag=args.norm_tag,
     )
     if not args.no_warmup:
         warmup(policy)

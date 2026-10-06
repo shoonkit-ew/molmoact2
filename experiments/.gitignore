@@ -25,6 +25,13 @@ pyrightconfig.json
 .ipynb_checkpoints
 
 
+# per-user secrets (finetune.sh reads these if the env var isn't already set)
+
+.wandb_api_key
+.wandb_entity
+.hf_access_token
+
+
 # miscellaneous
 
 .cache/

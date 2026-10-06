@@ -14,7 +14,7 @@ if str(_REPO_ROOT) not in sys.path:
 import debugpy
 
 from omegaconf import omegaconf, OmegaConf
-from launch_scripts.data_mixtures import TAG_METADATA_BY_TAG
+from launch_scripts.data_mixtures import MOLMOACT2_LEROBOT_VAL_DATASETS, TAG_METADATA_BY_TAG
 from launch_scripts.lerobot_utils.env import (
     _prepare_subprocess_environment_for_training,
     _run_torchcodec_preflight,
@@ -77,6 +77,7 @@ from olmo.tokenizer import DEFAULT_PAD_MULTIPLE
 from olmo.torch_util import get_world_size
 from olmo.train.optim import OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType
 from olmo.train.run_trainer import run_trainer
+from olmo.eval.action_validator import ActionValidatorConfig
 from olmo.train.trainer_config import TrainConfig, CompilerConfig, FSDPConfig, BatchDivisor, \
     SpeedMonitorConfig, WandbConfig
 from olmo.util import (
@@ -239,6 +240,12 @@ def main():
     )
     parser.add_argument("--n_obs_steps", default=1, type=int)
     parser.add_argument("--num_flow_timesteps", default=1, type=int)
+    parser.add_argument(
+        "--action_val_interval", default=0, type=int,
+        help="Run held-out action validation every N steps (and once before training). "
+             "Needs the mixture to be registered in MOLMOACT2_LEROBOT_VAL_DATASETS. 0 disables it.",
+    )
+    parser.add_argument("--action_val_examples_per_dataset", default=64, type=int)
     parser.add_argument("--flow_matching_beta_alpha", default=1.0, type=float)
     parser.add_argument("--flow_matching_beta_beta", default=1.5, type=float)
     parser.add_argument("--flow_matching_cutoff", default=1.0, type=float)
@@ -766,6 +773,19 @@ def main():
     num_workers = args.num_workers
     evaluations = []
     loss_evaluations = []
+    action_validator_cfg = None
+    if args.action_val_interval > 0:
+        if args.mixture not in MOLMOACT2_LEROBOT_VAL_DATASETS:
+            raise ValueError(
+                f"--action_val_interval needs held-out datasets for mixture '{args.mixture}' "
+                f"in MOLMOACT2_LEROBOT_VAL_DATASETS (launch_scripts/data_mixtures.py)."
+            )
+        action_validator_cfg = ActionValidatorConfig(
+            datasets=MOLMOACT2_LEROBOT_VAL_DATASETS[args.mixture](),
+            interval=args.action_val_interval,
+            examples_per_dataset=args.action_val_examples_per_dataset,
+            device_batch_size=args.device_batch_size,
+        )
 
     log_interval = 1 if args.debug else args.log_interval
     dynamic_sequence_length = bool(args.dynamic_seq_len)
@@ -777,6 +797,8 @@ def main():
             "Using dynamic non-packing sequence lengths with preprocessor max_sequence_length=%s.",
             preprocessor_sequence_length,
         )
+    if action_validator_cfg is not None:
+        action_validator_cfg.sequence_length = preprocessor_sequence_length
 
     primary_data_cfg = DataLoaderConfig(
         kwargs_mixture=train_mixture,
@@ -886,6 +908,7 @@ def main():
         softmax_auxiliary_loss_scale=1e-4,
         inf_evaluators=evaluations,
         evaluators=loss_evaluations,
+        action_validator=action_validator_cfg,
         inf_eval_interval=2000,
         eval_interval=2000,
         save_final_unsharded_checkpoint=False,

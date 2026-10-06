@@ -57,6 +57,7 @@ from .timer import TimerManager
 from olmo.data.data_loader import DataLoaderConfig, KwargsMixture
 from olmo.data.iterable_dataset_mixture import IterableDatasetMixture, WorkerState, \
     IterableDataMixtureCheckpoint
+from olmo.eval.action_validator import ActionValidator
 from olmo.eval.inf_evaluator import InfDatasetEvaluator
 from olmo.eval.loss_evaluator import LossMetrics, LossDatasetEvaluator
 from olmo.exceptions import OLMoConfigurationError
@@ -488,6 +489,7 @@ class Trainer:
     cur_train_loss: float = float("inf")
     loss_fn: Callable[..., torch.Tensor] = field(default_factory=lambda: cross_entropy_loss)  # type: ignore
     beaker_logger: BeakerLogger = None
+    action_validator: Optional[ActionValidator] = None
     last_sharded_checkpoint_step: Optional[int] = None
     last_unsharded_checkpoint_step: Optional[int] = None
     _train_metrics: Any = None
@@ -2252,6 +2254,15 @@ class Trainer:
             self.model.cpu()
         return all_metrics
 
+    def action_validation(self) -> Dict[str, float]:
+        self.optim.zero_grad(set_to_none=True)
+        metrics = self.action_validator.run(self.fsdp_model, self.cfg.autocast_precision)
+        self.fsdp_model.train()
+        self.log_metrics_to_console(f"[step={self.global_step}] action validation", metrics)
+        if wandb.run is not None:
+            wandb.log(metrics, step=self.global_step)
+        return metrics
+
     def loss_eval(self) -> Dict[str, Union[float, WBValue]]:
         self.optim.zero_grad(set_to_none=True)
         self.fsdp_model.eval()
@@ -2415,6 +2426,10 @@ class Trainer:
             import contextlib
 
             torch_profiler = contextlib.nullcontext()
+
+        # Baseline before any step: also fails fast if validation doesn't fit in memory.
+        if self.action_validator is not None:
+            self.action_validation()
 
         # Train.
         first_batch: bool = True
@@ -2620,6 +2635,12 @@ class Trainer:
                         # Reset model to 'train' mode.
                         self.fsdp_model.train()
 
+                    if not cancel_initiated and self.action_validator is not None and (
+                        (self.global_step % self.cfg.action_validator.interval == 0) or last_step
+                    ):
+                        self.action_validation()
+                        speed_monitor.reset()
+
                     # End of batch.
                     first_batch = False
                     if p is not None:
@@ -2683,7 +2704,7 @@ class Trainer:
         if wandb.run is not None:
             if exit_code != 0:
                 log.info(f"Finishing wandb with exit code {exit_code}")
-            wandb.finish(exit_code=exit_code, quiet=True)
+            wandb.finish(exit_code=exit_code)
         gc_cuda()
         if self._gc_init_state:
             gc.enable()

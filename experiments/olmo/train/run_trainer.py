@@ -543,6 +543,10 @@ def run_trainer(cfg: TrainConfig) -> None:
             device=device) for v in cfg.inf_evaluators]
     else:
         inf_evaluators = None
+    action_validator = None
+    if cfg.action_validator is not None and cfg.action_validator.interval > 0:
+        action_validator = cfg.action_validator.build(
+            model_config=cfg.model, mesh=world_mesh, device=device)
 
     # Maybe build the BeakerLogger
     if "BEAKER_EXPERIMENT_ID" in os.environ and "BEAKER_TOKEN" in os.environ:
@@ -594,7 +598,7 @@ def run_trainer(cfg: TrainConfig) -> None:
             resume=resume_mode,
             settings=wandb.Settings(init_timeout=180)
         )
-        wandb_url = wandb.run.get_url()
+        wandb_url = wandb.run.url
         if beaker_logger is not None:
             beaker_logger.add_wandb(wandb_url)  # add wandb url to beaker description
 
@@ -625,7 +629,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         beaker_experiment_id=os.environ.get("BEAKER_EXPERIMENT_ID"),
         beaker_experiment_url=(None if beaker_logger is None else
                                beaker_logger.get_beaker_url()),
-        wandb_url=wandb.run.get_url() if wandb.run else None,
+        wandb_url=wandb.run.url if wandb.run else None,
         wandb_id=wandb.run.id if wandb.run else None,
         args=" ".join(sys.argv),
         resuming_from=start_from if is_resuming else None,
@@ -653,6 +657,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         device=device,
         evaluators=evaluators,
         inference_evaluators=inf_evaluators,
+        action_validator=action_validator,
         beaker_logger=beaker_logger,
     ) as trainer:
         lora_injected = False

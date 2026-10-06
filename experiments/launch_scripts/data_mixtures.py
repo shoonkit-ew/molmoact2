@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from launch_scripts.data_constants import (
@@ -389,6 +391,55 @@ def build_molmoact2_so100_so101() -> Tuple[List[RawMixtureEntry], Dict[str, Dict
     )
 
 
+# Per-task 80/20 split by whole episode (seeded permutation, same method as
+# evo's _split_episodes). The val episodes are never trained on; the offline
+# evaluator reads the same file. The 7 "*_depth" repos are excluded:
+# olmo/data/lerobot_wrapper.py's _canonicalize_depth_repo_id() strips a
+# trailing "_depth" when resolving tag metadata (meant for depth-annotation
+# companion datasets), so they always fail with "Missing repo-to-tag mapping".
+YAM_DATA_COLLECTION_SPLIT = Path(__file__).with_name("yam_data_collection_split.json")
+
+
+def _episode_ranges(episodes: Sequence[int]) -> str:
+    """[0, 1, 2, 5, 7, 8] -> "0-2,5,7-8" (the repo spec's @episodes syntax)."""
+    parts: List[str] = []
+    run_start = prev = episodes[0]
+    for ep in list(episodes[1:]) + [None]:
+        if ep is not None and ep == prev + 1:
+            prev = ep
+            continue
+        parts.append(str(run_start) if run_start == prev else f"{run_start}-{prev}")
+        if ep is not None:
+            run_start = prev = ep
+    return ",".join(parts)
+
+
+def yam_data_collection_val_datasets() -> List[str]:
+    split = json.loads(YAM_DATA_COLLECTION_SPLIT.read_text())
+    return [f"{LEROBOT_TAG_PREFIX}{repo}@{_episode_ranges(s['val'])}" for repo, s in split["repos"].items()]
+
+
+def build_molmoact2_yam_data_collection() -> Tuple[List[RawMixtureEntry], Dict[str, Dict[str, object]]]:
+    split = json.loads(YAM_DATA_COLLECTION_SPLIT.read_text())
+    return build_single_lerobot_mixture(
+        name="eastworlds_yam_data_collection",
+        tag="eastworlds_yam_data_collection",
+        repo_ids=[f"{repo}@{_episode_ranges(s['train'])}" for repo, s in split["repos"].items()],
+        action_key="action",
+        state_keys=["observation.state"],
+        camera_keys=[
+            "observation.images.head_cam",
+            "observation.images.wrist_left",
+            "observation.images.wrist_right",
+        ],
+        normalize_gripper=False,
+        setup_type="bimanual yam robotic arms in molmoact2",
+        control_mode="absolute joint pose",
+        action_horizon=30,
+        n_action_steps=30,
+    )
+
+
 MOLMOACT2_LEROBOT_MIXTURES: Dict[str, MixtureBuilder] = {
     "pre_post_train": build_molmoact2_pre_post_train,
     "droid": build_molmoact2_droid,
@@ -396,4 +447,10 @@ MOLMOACT2_LEROBOT_MIXTURES: Dict[str, MixtureBuilder] = {
     "libero_goal": build_molmoact2_libero_goal,
     "yam": build_molmoact2_yam,
     "so100_so101": build_molmoact2_so100_so101,
+    "yam_data_collection": build_molmoact2_yam_data_collection,
+}
+
+# Held-out LeRobot dataset specs per mixture, for --action_val_interval.
+MOLMOACT2_LEROBOT_VAL_DATASETS: Dict[str, Callable[[], List[str]]] = {
+    "yam_data_collection": yam_data_collection_val_datasets,
 }
